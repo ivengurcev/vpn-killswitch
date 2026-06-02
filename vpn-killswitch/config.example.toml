@@ -1,0 +1,17 @@
+# vpn-killswitch example configuration.
+
+[vpn]
+connection_name = "VPN connection name"
+connection_types = ["vpn", "wireguard"]
+
+[bypass]
+domains = ["ozon.ru", "wildberries.ru"]
+state_path = "/run/vpn-killswitch/bypass-routes.v4"
+
+[killswitch]
+domains = ["example.com", "api.example.com"]
+manage_hosts = true
+hosts_file = "/etc/hosts"
+nft_table_name = "vpn_killswitch_lock"
+state_dir = "/var/lib/vpn-killswitch"
+run_dir = "/run/vpn-killswitch"
