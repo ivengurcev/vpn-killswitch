@@ -1,0 +1,13 @@
+# Local build artifacts
+/vpn-bypass/vpn-bypass
+/vpn-killswitch/vpn-killswitch
+/vpn-killswitch-tray/vpn-killswitch-tray
+
+# Go test/build outputs
+*.test
+*.out
+coverage.txt
+
+# Editor/OS noise
+.DS_Store
+*~
