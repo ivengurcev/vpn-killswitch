@@ -40,6 +40,16 @@ run() {
   fi
 }
 
+try_run() {
+  if [ "$APPLY" -eq 1 ]; then
+    "$@" 2>/dev/null || log "warning: ignored failure: $*"
+  else
+    printf 'DRY-RUN'
+    printf ' %q' "$@"
+    printf '\n'
+  fi
+}
+
 remove_file() {
   local path="$1"
   if [ -e "$path" ] || [ -L "$path" ]; then
@@ -92,14 +102,14 @@ remove_route_state() {
     [ -n "${gateway:-}" ] || continue
     [ -n "${dev:-}" ] || continue
     if command -v ip >/dev/null 2>&1; then
-      run ip route del "${ip}/32" via "$gateway" dev "$dev"
+      try_run ip route del "${ip}/32" via "$gateway" dev "$dev"
     fi
   done <"$state_file"
 }
 
 systemctl_if_present() {
   if command -v systemctl >/dev/null 2>&1; then
-    run systemctl "$@"
+    try_run systemctl "$@"
   fi
 }
 
@@ -113,11 +123,11 @@ cleanup_vpn_lock() {
   systemctl_if_present disable --now vpn-lock.service
 
   if [ -x /usr/local/sbin/vpn-lock ]; then
-    run /usr/local/sbin/vpn-lock disable legacy-cleanup
+    try_run /usr/local/sbin/vpn-lock disable legacy-cleanup
   fi
 
   if command -v nft >/dev/null 2>&1; then
-    run nft delete table inet "$nft_table"
+    try_run nft delete table inet "$nft_table"
   fi
 
   remove_hosts_block /etc/hosts "# vpn-lock managed block: begin" "# vpn-lock managed block: end"

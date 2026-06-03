@@ -1,0 +1,1179 @@
+#!/usr/bin/env bash
+set -u
+set -o pipefail
+
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+CONFIG_FILE="${VPN_LOCK_CONFIG:-/etc/vpn-lock/vpn-lock.conf}"
+DEFAULT_LOG_FILE="/var/log/vpn-lock.log"
+
+VPN_CONNECTION_NAME=""
+PROTECTED_DOMAINS=()
+LOG_FILE="$DEFAULT_LOG_FILE"
+STATE_DIR="/var/lib/vpn-lock"
+RUN_DIR="/run/vpn-lock"
+HOSTS_FILE="/etc/hosts"
+NFT_TABLE_NAME="vpn_lock"
+RESOLVE_TIMEOUT_SECONDS="10"
+LOCK_TIMEOUT_SECONDS="10"
+REFRESH_INTERVAL_MINUTES="5"
+MANAGE_HOSTS="true"
+VPN_CONNECTION_TYPES="vpn wireguard"
+
+HOSTS_BEGIN="# vpn-lock managed block: begin"
+HOSTS_END="# vpn-lock managed block: end"
+LOCK_FD=""
+
+RESOLVED_IPV4=()
+RESOLVED_IPV6=()
+
+usage() {
+  cat <<'EOF'
+Usage: vpn-lock <command> [reason]
+
+Commands:
+  enforce [reason]     Detect VPN state and apply the correct protection mode.
+  enable [reason]      Force protection on.
+  disable [reason]     Force protection off.
+  refresh [reason]     If VPN is inactive, refresh nftables IP sets via delta updates.
+  status               Print VPN/protection status.
+  resolve              Resolve protected domains and print current IP sets.
+  test                 Run diagnostic checks against the current state.
+  install-check        Validate configuration and required commands.
+  help                 Show this help.
+EOF
+}
+
+log() {
+  local level="$1"
+  shift || true
+  local message="$*"
+  local timestamp line log_dir
+
+  timestamp="$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date)"
+  line="${timestamp} [${level}] ${message}"
+  log_dir="$(dirname "$LOG_FILE" 2>/dev/null || printf '%s\n' /var/log)"
+
+  mkdir -p "$log_dir" 2>/dev/null || true
+
+  if ! { printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null; then
+    printf '%s\n' "$line" >&2
+    if command -v logger >/dev/null 2>&1; then
+      logger -t vpn-lock -- "$line" 2>/dev/null || true
+    fi
+  fi
+}
+
+join_by_space() {
+  local out="" item
+  for item in "$@"; do
+    if [ -z "$out" ]; then
+      out="$item"
+    else
+      out="${out} ${item}"
+    fi
+  done
+  printf '%s\n' "$out"
+}
+
+bool_enabled() {
+  case "${1,,}" in
+    1|yes|y|true|on|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+load_config() {
+  VPN_CONNECTION_NAME=""
+  PROTECTED_DOMAINS=()
+  LOG_FILE="$DEFAULT_LOG_FILE"
+  STATE_DIR="/var/lib/vpn-lock"
+  RUN_DIR="/run/vpn-lock"
+  HOSTS_FILE="/etc/hosts"
+  NFT_TABLE_NAME="vpn_lock"
+  RESOLVE_TIMEOUT_SECONDS="10"
+  LOCK_TIMEOUT_SECONDS="10"
+  REFRESH_INTERVAL_MINUTES="5"
+  MANAGE_HOSTS="true"
+  VPN_CONNECTION_TYPES="vpn wireguard"
+
+  if [ ! -r "$CONFIG_FILE" ]; then
+    log ERROR "Configuration file is not readable: $CONFIG_FILE"
+    return 1
+  fi
+
+  # shellcheck source=/etc/vpn-lock/vpn-lock.conf
+  source "$CONFIG_FILE"
+
+  normalize_domains
+}
+
+normalize_domains() {
+  local -A seen=()
+  local normalized=()
+  local raw token domain
+
+  for raw in "${PROTECTED_DOMAINS[@]:-}"; do
+    raw="${raw//,/ }"
+    for token in $raw; do
+      domain="${token%.}"
+      domain="${domain,,}"
+
+      if [ -z "$domain" ]; then
+        continue
+      fi
+
+      if [[ "$domain" == *".."* ]] || [[ ! "$domain" =~ ^[a-z0-9][a-z0-9._-]*[a-z0-9]$|^[a-z0-9]$ ]]; then
+        log ERROR "Invalid protected domain in configuration: $token"
+        return 1
+      fi
+
+      if [ -z "${seen[$domain]+x}" ]; then
+        seen[$domain]=1
+        normalized+=("$domain")
+      fi
+    done
+  done
+
+  PROTECTED_DOMAINS=("${normalized[@]}")
+}
+
+validate_config() {
+  local ok=0
+
+  if [ -z "${VPN_CONNECTION_NAME:-}" ]; then
+    log ERROR "VPN_CONNECTION_NAME is empty"
+    ok=1
+  fi
+
+  if [ "${#PROTECTED_DOMAINS[@]}" -eq 0 ]; then
+    log ERROR "PROTECTED_DOMAINS is empty"
+    ok=1
+  fi
+
+  if [[ ! "$NFT_TABLE_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    log ERROR "NFT_TABLE_NAME must be a simple nftables identifier"
+    ok=1
+  fi
+
+  if [[ ! "$RESOLVE_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || [ "$RESOLVE_TIMEOUT_SECONDS" -lt 1 ]; then
+    log ERROR "RESOLVE_TIMEOUT_SECONDS must be a positive integer"
+    ok=1
+  fi
+
+  if [[ ! "$LOCK_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || [ "$LOCK_TIMEOUT_SECONDS" -lt 1 ]; then
+    log ERROR "LOCK_TIMEOUT_SECONDS must be a positive integer"
+    ok=1
+  fi
+
+  if [[ ! "$REFRESH_INTERVAL_MINUTES" =~ ^[0-9]+$ ]] || [ "$REFRESH_INTERVAL_MINUTES" -lt 1 ]; then
+    log ERROR "REFRESH_INTERVAL_MINUTES must be a positive integer"
+    ok=1
+  fi
+
+  return "$ok"
+}
+
+ensure_runtime_dirs() {
+  if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+    log ERROR "Unable to create state directory: $STATE_DIR"
+    return 1
+  fi
+  if ! mkdir -p "$RUN_DIR" 2>/dev/null; then
+    log ERROR "Runtime directory is not available: $RUN_DIR"
+    return 1
+  fi
+}
+
+acquire_lock() {
+  local lock_file fd
+
+  if ! command -v flock >/dev/null 2>&1; then
+    log ERROR "flock is not installed; cannot serialize concurrent runs"
+    return 1
+  fi
+
+  if [ ! -d "$RUN_DIR" ]; then
+    log ERROR "Runtime directory does not exist: $RUN_DIR (expected to be provisioned by the installer)"
+    return 1
+  fi
+
+  lock_file="${RUN_DIR%/}/lock"
+
+  if ! exec {fd}>"$lock_file"; then
+    log ERROR "Unable to open lock file: $lock_file"
+    return 1
+  fi
+
+  if ! flock -w "$LOCK_TIMEOUT_SECONDS" "$fd"; then
+    log INFO "Another vpn-lock instance is running; exiting without action"
+    eval "exec ${fd}>&-"
+    return 2
+  fi
+
+  LOCK_FD="$fd"
+  return 0
+}
+
+vpn_type_matches() {
+  local type="$1"
+  local allowed="${VPN_CONNECTION_TYPES:-vpn wireguard}"
+  local t
+  for t in $allowed; do
+    if [ "$t" = "$type" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_vpn_status() {
+  local output rc line name name_unescaped type
+
+  if ! command -v nmcli >/dev/null 2>&1; then
+    log ERROR "nmcli is not installed; VPN state is unknown"
+    printf '%s\n' unknown
+    return 2
+  fi
+
+  output="$(nmcli -t -f NAME,TYPE connection show --active 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    output="${output//$'\n'/; }"
+    log ERROR "Unable to query NetworkManager active connections: $output"
+    printf '%s\n' unknown
+    return 2
+  fi
+
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    name="${line%:*}"
+    type="${line##*:}"
+    name_unescaped="${name//\\:/:}"
+
+    if [ "$name" != "$VPN_CONNECTION_NAME" ] && [ "$name_unescaped" != "$VPN_CONNECTION_NAME" ]; then
+      continue
+    fi
+
+    if vpn_type_matches "$type"; then
+      printf '%s\n' active
+      return 0
+    fi
+
+    log WARN "Active connection '${VPN_CONNECTION_NAME}' has non-VPN type '${type}'; treating VPN as inactive"
+  done <<<"$output"
+
+  printf '%s\n' inactive
+  return 1
+}
+
+rewrite_hosts_file() {
+  local mode="$1"
+  local file="$HOSTS_FILE"
+  local dir tmp perms uid gid
+
+  dir="$(dirname "$file")"
+  mkdir -p "$dir" || {
+    log ERROR "Unable to create hosts directory: $dir"
+    return 1
+  }
+
+  if [ ! -e "$file" ]; then
+    touch "$file" || {
+      log ERROR "Unable to create hosts file: $file"
+      return 1
+    }
+  fi
+
+  tmp="$(mktemp "${dir%/}/.vpn-lock.hosts.XXXXXX")" || {
+    log ERROR "Unable to create temporary hosts file in $dir"
+    return 1
+  }
+
+  perms="$(stat -c '%a' "$file" 2>/dev/null || printf '%s\n' 644)"
+  uid="$(stat -c '%u' "$file" 2>/dev/null || printf '%s\n' 0)"
+  gid="$(stat -c '%g' "$file" 2>/dev/null || printf '%s\n' 0)"
+
+  if ! awk -v begin="$HOSTS_BEGIN" -v end="$HOSTS_END" '
+    $0 == begin { skip = 1; next }
+    $0 == end { skip = 0; next }
+    !skip { print }
+  ' "$file" >"$tmp"; then
+    rm -f "$tmp"
+    log ERROR "Unable to remove existing managed block from $file"
+    return 1
+  fi
+
+  if [ "$mode" = "add" ]; then
+    {
+      printf '\n%s\n' "$HOSTS_BEGIN"
+      local domain
+      for domain in "${PROTECTED_DOMAINS[@]}"; do
+        printf '0.0.0.0 %s\n' "$domain"
+        printf ':: %s\n' "$domain"
+      done
+      printf '%s\n' "$HOSTS_END"
+    } >>"$tmp"
+  fi
+
+  chown "$uid:$gid" "$tmp" 2>/dev/null || true
+  chmod "$perms" "$tmp" 2>/dev/null || true
+
+  if ! mv "$tmp" "$file"; then
+    rm -f "$tmp"
+    log ERROR "Unable to replace hosts file: $file"
+    return 1
+  fi
+}
+
+apply_hosts_block() {
+  if bool_enabled "$MANAGE_HOSTS"; then
+    if rewrite_hosts_file add; then
+      log INFO "Hosts block enabled for domains: $(join_by_space "${PROTECTED_DOMAINS[@]}")"
+      return 0
+    fi
+    return 1
+  fi
+
+  remove_hosts_block
+}
+
+remove_hosts_block() {
+  if [ ! -e "$HOSTS_FILE" ]; then
+    return 0
+  fi
+
+  if rewrite_hosts_file remove; then
+    log INFO "Hosts block removed"
+    return 0
+  fi
+  return 1
+}
+
+is_ipv4() {
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+is_ipv6() {
+  local ip="${1,,}"
+  [[ "$ip" == *:* && "$ip" != ::ffff:* ]]
+}
+
+ipv4_is_filtered() {
+  local ip="$1"
+  local a b
+  IFS=. read -r a b _ _ <<<"$ip"
+
+  if [ "$ip" = "0.0.0.0" ]; then
+    return 0
+  fi
+  case "$a" in
+    10|127) return 0 ;;
+  esac
+  if [ "$a" = "169" ] && [ "$b" = "254" ]; then
+    return 0
+  fi
+  if [ "$a" = "192" ] && [ "$b" = "168" ]; then
+    return 0
+  fi
+  if [ "$a" = "172" ]; then
+    case "$b" in
+      1[6-9]|2[0-9]|3[01]) return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+ipv6_is_filtered() {
+  local ip="${1,,}"
+  case "$ip" in
+    ::|::1) return 0 ;;
+    fe[89ab][0-9a-f]:*) return 0 ;;
+  esac
+  return 1
+}
+
+record_resolved_ip() {
+  local ip="$1"
+  local -n seen4_ref="$2"
+  local -n seen6_ref="$3"
+  local domain="${4:-?}"
+
+  if [[ "${ip,,}" == ::ffff:* ]]; then
+    ip="${ip#::ffff:}"
+    ip="${ip#::FFFF:}"
+  fi
+
+  if is_ipv4 "$ip"; then
+    if ipv4_is_filtered "$ip"; then
+      if [ -z "${seen4_ref[$ip]+x}" ]; then
+        seen4_ref[$ip]=0
+        log WARN "Skipping non-public IPv4 address ${ip} for domain ${domain}"
+      fi
+      return 1
+    fi
+    if [ -z "${seen4_ref[$ip]+x}" ]; then
+      seen4_ref[$ip]=1
+      RESOLVED_IPV4+=("$ip")
+    fi
+    return 0
+  fi
+
+  if is_ipv6 "$ip"; then
+    if ipv6_is_filtered "$ip"; then
+      if [ -z "${seen6_ref[$ip]+x}" ]; then
+        seen6_ref[$ip]=0
+        log WARN "Skipping non-public IPv6 address ${ip} for domain ${domain}"
+      fi
+      return 1
+    fi
+    if [ -z "${seen6_ref[$ip]+x}" ]; then
+      seen6_ref[$ip]=1
+      RESOLVED_IPV6+=("$ip")
+    fi
+    return 0
+  fi
+
+  return 1
+}
+
+resolve_getent() {
+  local database="$1"
+  local domain="$2"
+
+  if ! command -v getent >/dev/null 2>&1; then
+    return 127
+  fi
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${RESOLVE_TIMEOUT_SECONDS}s" getent "$database" "$domain"
+  else
+    getent "$database" "$domain"
+  fi
+}
+
+resolve_domains() {
+  local fail_level="${1:-ERROR}"
+  local -A seen4=()
+  local -A seen6=()
+  local domain output rc ip rest domain_count failures=0
+
+  RESOLVED_IPV4=()
+  RESOLVED_IPV6=()
+
+  for domain in "${PROTECTED_DOMAINS[@]}"; do
+    domain_count=0
+
+    output="$(resolve_getent ahostsv4 "$domain" 2>/dev/null)"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      while read -r ip rest; do
+        if record_resolved_ip "$ip" seen4 seen6 "$domain"; then
+          domain_count=$((domain_count + 1))
+        fi
+      done <<<"$output"
+    fi
+
+    output="$(resolve_getent ahostsv6 "$domain" 2>/dev/null)"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      while read -r ip rest; do
+        if record_resolved_ip "$ip" seen4 seen6 "$domain"; then
+          domain_count=$((domain_count + 1))
+        fi
+      done <<<"$output"
+    fi
+
+    if [ "$domain_count" -eq 0 ]; then
+      log "$fail_level" "Unable to resolve protected domain: $domain"
+      failures=$((failures + 1))
+    fi
+  done
+
+  if [ "$failures" -ne 0 ]; then
+    log "$fail_level" "IP update failed for $failures protected domain(s)"
+    return 1
+  fi
+
+  log INFO "Resolved protected domains to ${#RESOLVED_IPV4[@]} IPv4 and ${#RESOLVED_IPV6[@]} IPv6 address(es)"
+  return 0
+}
+
+format_nft_elements() {
+  local -n items="$1"
+  local item separator="" out=""
+
+  for item in "${items[@]}"; do
+    out="${out}${separator}${item}"
+    separator=", "
+  done
+
+  printf '%s\n' "$out"
+}
+
+print_ip_list() {
+  local -n items="$1"
+
+  if [ "${#items[@]}" -eq 0 ]; then
+    printf '  none\n'
+    return 0
+  fi
+
+  printf '  %s\n' "${items[@]}"
+}
+
+nft_table_exists() {
+  command -v nft >/dev/null 2>&1 && nft list table inet "$NFT_TABLE_NAME" >/dev/null 2>&1
+}
+
+apply_nft_rules() {
+  local script first_cmd output rc ipv4_elements ipv6_elements
+
+  if ! command -v nft >/dev/null 2>&1; then
+    log ERROR "nft is not installed; cannot apply IP protection"
+    return 1
+  fi
+
+  ensure_runtime_dirs || return 1
+
+  script="$(mktemp "${RUN_DIR%/}/nft.XXXXXX")" || {
+    log ERROR "Unable to create temporary nft script"
+    return 1
+  }
+
+  if nft_table_exists; then
+    first_cmd="flush table inet ${NFT_TABLE_NAME}"
+  else
+    first_cmd="add table inet ${NFT_TABLE_NAME}"
+  fi
+
+  ipv4_elements="$(format_nft_elements RESOLVED_IPV4)"
+  ipv6_elements="$(format_nft_elements RESOLVED_IPV6)"
+
+  {
+    printf '%s\n' "$first_cmd"
+    printf 'add set inet %s blocked_ipv4 { type ipv4_addr; }\n' "$NFT_TABLE_NAME"
+    printf 'add set inet %s blocked_ipv6 { type ipv6_addr; }\n' "$NFT_TABLE_NAME"
+    if [ -n "$ipv4_elements" ]; then
+      printf 'add element inet %s blocked_ipv4 { %s }\n' "$NFT_TABLE_NAME" "$ipv4_elements"
+    fi
+    if [ -n "$ipv6_elements" ]; then
+      printf 'add element inet %s blocked_ipv6 { %s }\n' "$NFT_TABLE_NAME" "$ipv6_elements"
+    fi
+    printf 'add chain inet %s vpn_lock_output { type filter hook output priority 0; policy accept; }\n' "$NFT_TABLE_NAME"
+    printf 'add chain inet %s vpn_lock_forward { type filter hook forward priority 0; policy accept; }\n' "$NFT_TABLE_NAME"
+    printf 'add rule inet %s vpn_lock_output ip daddr @blocked_ipv4 counter reject\n' "$NFT_TABLE_NAME"
+    printf 'add rule inet %s vpn_lock_output ip6 daddr @blocked_ipv6 counter reject\n' "$NFT_TABLE_NAME"
+    printf 'add rule inet %s vpn_lock_forward ip daddr @blocked_ipv4 counter reject\n' "$NFT_TABLE_NAME"
+    printf 'add rule inet %s vpn_lock_forward ip6 daddr @blocked_ipv6 counter reject\n' "$NFT_TABLE_NAME"
+  } >"$script"
+
+  output="$(nft -f "$script" 2>&1)"
+  rc=$?
+  rm -f "$script"
+
+  if [ "$rc" -ne 0 ]; then
+    output="${output//$'\n'/; }"
+    log ERROR "Unable to apply nftables protection: $output"
+    return 1
+  fi
+
+  log INFO "nftables protection enabled with ${#RESOLVED_IPV4[@]} IPv4 and ${#RESOLVED_IPV6[@]} IPv6 address(es)"
+  return 0
+}
+
+delete_nft_rules() {
+  local output rc
+
+  if ! command -v nft >/dev/null 2>&1; then
+    log ERROR "nft is not installed; cannot remove IP protection"
+    return 1
+  fi
+
+  if ! nft_table_exists; then
+    log INFO "nftables protection table is already absent"
+    return 0
+  fi
+
+  output="$(nft delete table inet "$NFT_TABLE_NAME" 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    output="${output//$'\n'/; }"
+    log ERROR "Unable to delete nftables protection table: $output"
+    return 1
+  fi
+
+  log INFO "nftables protection removed"
+  return 0
+}
+
+nft_set_elements() {
+  local set_name="$1"
+  local output
+
+  command -v nft >/dev/null 2>&1 || return 1
+  output="$(nft list set inet "$NFT_TABLE_NAME" "$set_name" 2>/dev/null)" || return 1
+
+  printf '%s\n' "$output" \
+    | awk '
+        /elements = \{/ {
+          sub(/.*elements = \{/, "")
+          inside = 1
+        }
+        inside {
+          if (match($0, /\}/)) {
+            sub(/\}.*/, "")
+            inside = 0
+            print
+            next
+          }
+          print
+        }
+      ' \
+    | tr ',' '\n' \
+    | tr -d ' \t' \
+    | grep -v '^$' \
+    | sort -u
+}
+
+apply_nft_delta() {
+  local current_ipv4 current_ipv6
+  local -A current4=() current6=() desired4=() desired6=()
+  local add4=() add6=() del4=() del6=()
+  local ip script output rc
+
+  if ! command -v nft >/dev/null 2>&1; then
+    log ERROR "nft is not installed; cannot update IP protection"
+    return 1
+  fi
+
+  current_ipv4="$(nft_set_elements blocked_ipv4 || true)"
+  current_ipv6="$(nft_set_elements blocked_ipv6 || true)"
+
+  while IFS= read -r ip; do
+    [ -n "$ip" ] && current4[$ip]=1
+  done <<<"$current_ipv4"
+  while IFS= read -r ip; do
+    [ -n "${ip,,}" ] && current6[${ip,,}]=1
+  done <<<"$current_ipv6"
+
+  for ip in "${RESOLVED_IPV4[@]:-}"; do
+    [ -n "$ip" ] && desired4[$ip]=1
+  done
+  for ip in "${RESOLVED_IPV6[@]:-}"; do
+    [ -n "${ip,,}" ] && desired6[${ip,,}]=1
+  done
+
+  for ip in "${!desired4[@]}"; do
+    [ -z "${current4[$ip]+x}" ] && add4+=("$ip")
+  done
+  for ip in "${!desired6[@]}"; do
+    [ -z "${current6[$ip]+x}" ] && add6+=("$ip")
+  done
+  for ip in "${!current4[@]}"; do
+    [ -z "${desired4[$ip]+x}" ] && del4+=("$ip")
+  done
+  for ip in "${!current6[@]}"; do
+    [ -z "${desired6[$ip]+x}" ] && del6+=("$ip")
+  done
+
+  if [ "${#add4[@]}" -eq 0 ] && [ "${#add6[@]}" -eq 0 ] \
+     && [ "${#del4[@]}" -eq 0 ] && [ "${#del6[@]}" -eq 0 ]; then
+    log INFO "Periodic refresh: nft sets already up to date"
+    return 0
+  fi
+
+  ensure_runtime_dirs || return 1
+  script="$(mktemp "${RUN_DIR%/}/nft-delta.XXXXXX")" || {
+    log ERROR "Unable to create temporary nft script"
+    return 1
+  }
+
+  {
+    if [ "${#del4[@]}" -gt 0 ]; then
+      printf 'delete element inet %s blocked_ipv4 { %s }\n' \
+        "$NFT_TABLE_NAME" "$(IFS=,; printf '%s' "${del4[*]}")"
+    fi
+    if [ "${#del6[@]}" -gt 0 ]; then
+      printf 'delete element inet %s blocked_ipv6 { %s }\n' \
+        "$NFT_TABLE_NAME" "$(IFS=,; printf '%s' "${del6[*]}")"
+    fi
+    if [ "${#add4[@]}" -gt 0 ]; then
+      printf 'add element inet %s blocked_ipv4 { %s }\n' \
+        "$NFT_TABLE_NAME" "$(IFS=,; printf '%s' "${add4[*]}")"
+    fi
+    if [ "${#add6[@]}" -gt 0 ]; then
+      printf 'add element inet %s blocked_ipv6 { %s }\n' \
+        "$NFT_TABLE_NAME" "$(IFS=,; printf '%s' "${add6[*]}")"
+    fi
+  } >"$script"
+
+  output="$(nft -f "$script" 2>&1)"
+  rc=$?
+  rm -f "$script"
+
+  if [ "$rc" -ne 0 ]; then
+    output="${output//$'\n'/; }"
+    log ERROR "Unable to apply nftables delta: $output"
+    return 1
+  fi
+
+  log INFO "Periodic refresh applied: +${#add4[@]} IPv4 / +${#add6[@]} IPv6 added, ${#del4[@]} IPv4 / ${#del6[@]} IPv6 removed"
+  return 0
+}
+
+save_ip_cache() {
+  local tmp4 tmp6
+
+  mkdir -p "$STATE_DIR" || return 1
+  tmp4="$(mktemp "${STATE_DIR%/}/blocked_ipv4.XXXXXX")" || return 1
+  tmp6="$(mktemp "${STATE_DIR%/}/blocked_ipv6.XXXXXX")" || {
+    rm -f "$tmp4"
+    return 1
+  }
+
+  : >"$tmp4"
+  : >"$tmp6"
+
+  if [ "${#RESOLVED_IPV4[@]}" -gt 0 ]; then
+    printf '%s\n' "${RESOLVED_IPV4[@]}" >"$tmp4"
+  fi
+
+  if [ "${#RESOLVED_IPV6[@]}" -gt 0 ]; then
+    printf '%s\n' "${RESOLVED_IPV6[@]}" >"$tmp6"
+  fi
+
+  mv "$tmp4" "${STATE_DIR%/}/blocked_ipv4.list" &&
+    mv "$tmp6" "${STATE_DIR%/}/blocked_ipv6.list"
+}
+
+refresh_ip_cache() {
+  local fail_level="${1:-ERROR}"
+  if resolve_domains "$fail_level"; then
+    if save_ip_cache; then
+      log INFO "Resolved IP cache refreshed"
+      return 0
+    fi
+    log "$fail_level" "Unable to save refreshed IP cache"
+    return 1
+  fi
+
+  log "$fail_level" "Unable to refresh resolved IP cache"
+  return 1
+}
+
+load_ip_cache() {
+  local file ip total=0
+
+  RESOLVED_IPV4=()
+  RESOLVED_IPV6=()
+
+  file="${STATE_DIR%/}/blocked_ipv4.list"
+  if [ -r "$file" ]; then
+    while IFS= read -r ip; do
+      if is_ipv4 "$ip"; then
+        RESOLVED_IPV4+=("$ip")
+        total=$((total + 1))
+      fi
+    done <"$file"
+  fi
+
+  file="${STATE_DIR%/}/blocked_ipv6.list"
+  if [ -r "$file" ]; then
+    while IFS= read -r ip; do
+      if is_ipv6 "$ip"; then
+        RESOLVED_IPV6+=("$ip")
+        total=$((total + 1))
+      fi
+    done <"$file"
+  fi
+
+  [ "$total" -gt 0 ]
+}
+
+enable_protection() {
+  local reason="${1:-manual}"
+  local hosts_ok=0 nft_ok=0
+  local have_ips=0 fresh=0
+
+  log INFO "Enabling protection; reason=${reason}"
+
+  if resolve_domains; then
+    have_ips=1
+    fresh=1
+  else
+    log ERROR "Fresh IP data is unavailable; trying cached protection data"
+    if load_ip_cache; then
+      log INFO "Loaded cached IP data: ${#RESOLVED_IPV4[@]} IPv4 and ${#RESOLVED_IPV6[@]} IPv6 address(es)"
+      have_ips=1
+    fi
+  fi
+
+  apply_hosts_block || hosts_ok=1
+
+  if [ "$have_ips" -eq 1 ]; then
+    if apply_nft_rules; then
+      if [ "$fresh" -eq 1 ]; then
+        save_ip_cache || log ERROR "Unable to save resolved IP cache"
+      fi
+    else
+      nft_ok=1
+    fi
+  else
+    if nft_table_exists; then
+      log ERROR "No cached IP data found; keeping existing nftables protection table"
+    else
+      log ERROR "No cached or active nftables protection data is available"
+      nft_ok=1
+    fi
+  fi
+
+  if [ "$hosts_ok" -eq 0 ] && [ "$nft_ok" -eq 0 ]; then
+    log INFO "Protection is enabled"
+    return 0
+  fi
+
+  log ERROR "Protection could not be fully enabled"
+  return 1
+}
+
+disable_protection() {
+  local reason="${1:-manual}"
+  local ok=0
+
+  log INFO "Disabling protection; reason=${reason}"
+
+  refresh_ip_cache WARN || true
+  remove_hosts_block || ok=1
+  delete_nft_rules || ok=1
+
+  if [ "$ok" -eq 0 ]; then
+    log INFO "Protection is disabled"
+    return 0
+  fi
+
+  log ERROR "Protection could not be fully disabled"
+  return 1
+}
+
+refresh_protection() {
+  local reason="${1:-manual}"
+  local status
+
+  status="$(detect_vpn_status)"
+  case "$status" in
+    active)
+      log INFO "VPN connection is active; periodic refresh is a no-op"
+      return 0
+      ;;
+    unknown)
+      log WARN "VPN status is unknown; periodic refresh skipped"
+      return 0
+      ;;
+  esac
+
+  if ! nft_table_exists; then
+    log INFO "nftables protection table is absent; periodic refresh skipped"
+    return 0
+  fi
+
+  if ! resolve_domains WARN; then
+    log WARN "Periodic refresh skipped: unable to resolve protected domains"
+    return 0
+  fi
+
+  apply_nft_delta || return 1
+  save_ip_cache || log WARN "Unable to save resolved IP cache after refresh"
+  return 0
+}
+
+enforce_state() {
+  local reason="${1:-manual}"
+  local status
+
+  status="$(detect_vpn_status)"
+  case "$status" in
+    active)
+      log INFO "VPN connection is active: $VPN_CONNECTION_NAME"
+      disable_protection "$reason"
+      ;;
+    inactive)
+      log INFO "VPN connection is inactive: $VPN_CONNECTION_NAME"
+      enable_protection "$reason"
+      ;;
+    *)
+      log ERROR "VPN connection status is unknown; applying fail-closed protection"
+      enable_protection "$reason"
+      ;;
+  esac
+}
+
+print_status() {
+  local status protection="absent"
+
+  status="$(detect_vpn_status)"
+  if nft_table_exists; then
+    protection="present"
+  fi
+
+  printf 'VPN connection: %s\n' "$VPN_CONNECTION_NAME"
+  printf 'VPN status: %s\n' "$status"
+  printf 'Protected domains: %s\n' "$(join_by_space "${PROTECTED_DOMAINS[@]}")"
+  printf 'nftables protection: %s\n' "$protection"
+  printf 'hosts management: %s\n' "$MANAGE_HOSTS"
+  printf 'log file: %s\n' "$LOG_FILE"
+}
+
+install_check() {
+  local missing=0 cmd
+
+  validate_config || missing=1
+
+  for cmd in nmcli nft getent awk mktemp stat flock; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      printf 'Missing command: %s\n' "$cmd" >&2
+      missing=1
+    fi
+  done
+
+  return "$missing"
+}
+
+hosts_managed_block_present() {
+  [ -f "$HOSTS_FILE" ] && grep -qF "$HOSTS_BEGIN" "$HOSTS_FILE" 2>/dev/null
+}
+
+DIAG_FAILURES=0
+
+diag_pass() {
+  printf 'OK   %s\n' "$1"
+}
+
+diag_fail() {
+  printf 'FAIL %s%s\n' "$1" "${2:+: $2}"
+  DIAG_FAILURES=$((DIAG_FAILURES + 1))
+}
+
+run_diagnostics() {
+  local cmd status n4 n6 file unit state
+
+  DIAG_FAILURES=0
+
+  if [ "$(id -u 2>/dev/null || printf '%s' 1)" -ne 0 ]; then
+    printf 'WARN running as non-root: nftables/hosts checks may be inaccurate\n'
+  fi
+
+  for cmd in nmcli nft getent awk mktemp stat flock; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      diag_pass "command available: $cmd"
+    else
+      diag_fail "command available: $cmd" "not in PATH"
+    fi
+  done
+
+  for file in \
+    /usr/local/sbin/vpn-lock \
+    /etc/vpn-lock/vpn-lock.conf \
+    /etc/systemd/system/vpn-lock.service \
+    /etc/systemd/system/vpn-lock-refresh.service \
+    /etc/systemd/system/vpn-lock-refresh.timer \
+    /etc/systemd/system-sleep/vpn-lock \
+    /etc/NetworkManager/dispatcher.d/90-vpn-lock \
+    /usr/lib/tmpfiles.d/vpn-lock.conf \
+    /etc/logrotate.d/vpn-lock; do
+    if [ -e "$file" ]; then
+      diag_pass "file present: $file"
+    else
+      diag_fail "file present: $file" "missing"
+    fi
+  done
+
+  if [ -d "$STATE_DIR" ]; then
+    diag_pass "state directory present: $STATE_DIR"
+  else
+    diag_fail "state directory present: $STATE_DIR" "missing"
+  fi
+
+  if [ -d "$RUN_DIR" ]; then
+    diag_pass "runtime directory present: $RUN_DIR"
+  else
+    diag_fail "runtime directory present: $RUN_DIR" "missing (tmpfiles.d should create it on boot)"
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    for unit in vpn-lock.service vpn-lock-refresh.timer; do
+      state="$(systemctl is-enabled "$unit" 2>/dev/null)"
+      [ -n "$state" ] || state="missing"
+      case "$state" in
+        enabled|enabled-runtime|alias|static|generated)
+          diag_pass "systemd unit enabled: $unit ($state)"
+          ;;
+        *)
+          diag_fail "systemd unit enabled: $unit" "is-enabled=$state"
+          ;;
+      esac
+    done
+
+    state="$(systemctl is-active vpn-lock-refresh.timer 2>/dev/null)"
+    [ -n "$state" ] || state="missing"
+    if [ "$state" = "active" ]; then
+      diag_pass "systemd timer active: vpn-lock-refresh.timer"
+    else
+      diag_fail "systemd timer active: vpn-lock-refresh.timer" "is-active=$state"
+    fi
+  else
+    printf 'INFO systemctl not available; systemd unit checks skipped\n'
+  fi
+
+  if validate_config 2>/dev/null; then
+    diag_pass "configuration is valid"
+  else
+    diag_fail "configuration is valid" "see ${LOG_FILE} for details"
+  fi
+
+  status="$(detect_vpn_status)"
+  printf 'INFO VPN status: %s\n' "$status"
+  printf 'INFO MANAGE_HOSTS: %s\n' "$MANAGE_HOSTS"
+
+  case "$status" in
+    inactive|unknown)
+      if nft_table_exists; then
+        diag_pass "nftables table 'inet $NFT_TABLE_NAME' is present (VPN $status)"
+      else
+        diag_fail "nftables table 'inet $NFT_TABLE_NAME' is present (VPN $status)" "fail-closed protection is missing"
+      fi
+
+      n4="$(nft_set_elements blocked_ipv4 2>/dev/null | wc -l)"
+      n6="$(nft_set_elements blocked_ipv6 2>/dev/null | wc -l)"
+      if [ "$n4" -gt 0 ] || [ "$n6" -gt 0 ]; then
+        diag_pass "blocked IP sets are populated (${n4} IPv4, ${n6} IPv6)"
+      else
+        diag_fail "blocked IP sets are populated" "blocked_ipv4 and blocked_ipv6 are both empty"
+      fi
+
+      if bool_enabled "$MANAGE_HOSTS"; then
+        if hosts_managed_block_present; then
+          diag_pass "managed block present in $HOSTS_FILE"
+        else
+          diag_fail "managed block present in $HOSTS_FILE" "block missing while MANAGE_HOSTS=true"
+        fi
+      else
+        if hosts_managed_block_present; then
+          diag_fail "managed block absent in $HOSTS_FILE" "block present while MANAGE_HOSTS=false"
+        else
+          diag_pass "managed block absent in $HOSTS_FILE (MANAGE_HOSTS=false)"
+        fi
+      fi
+      ;;
+    active)
+      if nft_table_exists; then
+        diag_fail "nftables table 'inet $NFT_TABLE_NAME' is absent (VPN active)" "table is still present"
+      else
+        diag_pass "nftables table 'inet $NFT_TABLE_NAME' is absent (VPN active)"
+      fi
+
+      if hosts_managed_block_present; then
+        diag_fail "managed block absent in $HOSTS_FILE (VPN active)" "block is still present"
+      else
+        diag_pass "managed block absent in $HOSTS_FILE (VPN active)"
+      fi
+      ;;
+  esac
+
+  if [ "$DIAG_FAILURES" -eq 0 ]; then
+    printf '\nAll checks passed.\n'
+    return 0
+  fi
+
+  printf '\n%d check(s) failed.\n' "$DIAG_FAILURES"
+  return 1
+}
+
+main() {
+  local command="${1:-enforce}"
+  local reason="${2:-manual}"
+  local lock_rc
+
+  case "$command" in
+    help|-h|--help)
+      usage
+      return 0
+      ;;
+  esac
+
+  load_config || return 1
+
+  case "$command" in
+    enforce)
+      validate_config || return 1
+      ensure_runtime_dirs || return 1
+      acquire_lock; lock_rc=$?
+      case "$lock_rc" in
+        0) ;;
+        2) return 0 ;;
+        *) return 1 ;;
+      esac
+      log INFO "vpn-lock started; command=enforce reason=${reason}"
+      enforce_state "$reason"
+      ;;
+    enable)
+      validate_config || return 1
+      ensure_runtime_dirs || return 1
+      acquire_lock; lock_rc=$?
+      case "$lock_rc" in
+        0) ;;
+        2) return 0 ;;
+        *) return 1 ;;
+      esac
+      log INFO "vpn-lock started; command=enable reason=${reason}"
+      enable_protection "$reason"
+      ;;
+    disable)
+      validate_config || return 1
+      ensure_runtime_dirs || return 1
+      acquire_lock; lock_rc=$?
+      case "$lock_rc" in
+        0) ;;
+        2) return 0 ;;
+        *) return 1 ;;
+      esac
+      log INFO "vpn-lock started; command=disable reason=${reason}"
+      disable_protection "$reason"
+      ;;
+    refresh)
+      validate_config || return 1
+      ensure_runtime_dirs || return 1
+      acquire_lock; lock_rc=$?
+      case "$lock_rc" in
+        0) ;;
+        2) return 0 ;;
+        *) return 1 ;;
+      esac
+      log INFO "vpn-lock started; command=refresh reason=${reason}"
+      refresh_protection "$reason"
+      ;;
+    status)
+      print_status
+      ;;
+    resolve)
+      validate_config || return 1
+      resolve_domains || return 1
+      printf 'IPv4:\n'
+      print_ip_list RESOLVED_IPV4
+      printf 'IPv6:\n'
+      print_ip_list RESOLVED_IPV6
+      ;;
+    install-check)
+      install_check
+      ;;
+    test)
+      run_diagnostics
+      ;;
+    *)
+      usage >&2
+      return 2
+      ;;
+  esac
+}
+
+main "$@"

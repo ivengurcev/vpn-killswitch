@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -u
+
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+interface="${1:-unknown}"
+action="${2:-unknown}"
+
+CONFIG_FILE="/etc/vpn-lock/vpn-lock.conf"
+RUN_DIR="/run/vpn-lock"
+DISPATCHER_DEBOUNCE_SECONDS=2
+
+if [ -r "$CONFIG_FILE" ]; then
+  # shellcheck source=/etc/vpn-lock/vpn-lock.conf
+  source "$CONFIG_FILE" 2>/dev/null || true
+fi
+
+[[ "$DISPATCHER_DEBOUNCE_SECONDS" =~ ^[0-9]+$ ]] || DISPATCHER_DEBOUNCE_SECONDS=2
+
+run_enforce() {
+  /usr/local/sbin/vpn-lock enforce "networkmanager:${action}:${interface}" &
+}
+
+run_with_debounce() {
+  local marker="${RUN_DIR%/}/dispatcher.marker"
+  local now mtime age
+
+  if [ -e "$marker" ]; then
+    now="$(date +%s 2>/dev/null || printf '%s\n' 0)"
+    mtime="$(stat -c %Y "$marker" 2>/dev/null || printf '%s\n' 0)"
+    age=$((now - mtime))
+    if [ "$age" -ge 0 ] && [ "$age" -lt "$DISPATCHER_DEBOUNCE_SECONDS" ]; then
+      return 0
+    fi
+  fi
+
+  mkdir -p "$RUN_DIR" 2>/dev/null
+  : >"$marker" 2>/dev/null || true
+  run_enforce
+}
+
+case "$action" in
+  vpn-up|vpn-down)
+    run_enforce
+    ;;
+  up|down|connectivity-change|dhcp4-change|dhcp6-change)
+    run_with_debounce
+    ;;
+esac
+
+exit 0

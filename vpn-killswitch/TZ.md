@@ -289,6 +289,46 @@ Fail-closed правило:
 - `config`: путь к конфигу;
 - `errors`: список ошибок диагностики текущего состояния.
 
+Контракт `status --json` для внешних клиентов, включая `vpn-killswitch-tray`:
+
+```json
+{
+  "vpn": {
+    "name": "Work VPN",
+    "types": ["vpn", "wireguard"],
+    "status": "active"
+  },
+  "gateway": {
+    "via": "192.168.3.1",
+    "dev": "wlp3s0",
+    "error": ""
+  },
+  "bypass": {
+    "domain_count": 13,
+    "route_count": 27,
+    "state_path": "/run/vpn-killswitch/bypass-routes.v4"
+  },
+  "lock": {
+    "domain_count": 6,
+    "nft_active": false,
+    "hosts_block": false,
+    "error": ""
+  },
+  "config": {
+    "path": "/etc/vpn-killswitch/config.toml"
+  },
+  "errors": []
+}
+```
+
+Стабильные значения `vpn.status`:
+
+- `active`;
+- `inactive`;
+- `unknown`.
+
+Внешние клиенты должны считать наличие элементов в `errors` предупреждением/ошибкой состояния и не пытаться самостоятельно исправлять систему в обход CLI.
+
 `vpn-killswitch test` должен проверять:
 
 - наличие зависимостей;

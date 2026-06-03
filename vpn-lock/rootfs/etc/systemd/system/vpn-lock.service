@@ -1,0 +1,12 @@
+[Unit]
+Description=VPN Lock protection reconciler
+Documentation=man:nft(8) man:nmcli(1)
+Wants=NetworkManager.service
+After=NetworkManager.service nftables.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpn-lock enforce systemd
+
+[Install]
+WantedBy=multi-user.target

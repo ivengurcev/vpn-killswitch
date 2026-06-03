@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -u
+
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+case "${1:-}/${2:-}" in
+  post/*)
+    /usr/local/sbin/vpn-lock enforce "systemd-sleep:${2:-unknown}" &
+    ;;
+esac
+
+exit 0
