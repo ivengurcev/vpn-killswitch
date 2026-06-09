@@ -25,6 +25,7 @@ type GatewayStatus struct {
 
 type BypassStatus struct {
 	DomainCount int    `json:"domain_count"`
+	IPCount     int    `json:"ip_count"`
 	RouteCount  int    `json:"route_count"`
 	StatePath   string `json:"state_path"`
 }

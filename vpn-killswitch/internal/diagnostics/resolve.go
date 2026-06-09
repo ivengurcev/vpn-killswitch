@@ -15,6 +15,7 @@ type LockResolver interface {
 
 type ResolveResult struct {
 	Bypass []ResolveItem `json:"bypass"`
+	IPs    []string      `json:"bypass_ips,omitempty"`
 	Lock   []ResolveItem `json:"lock"`
 }
 
@@ -35,6 +36,7 @@ func Resolve(cfg config.Config, bypassResolver BypassResolver, lockResolver Lock
 		}
 		result.Bypass = append(result.Bypass, item)
 	}
+	result.IPs = append(result.IPs, cfg.Bypass.IPs...)
 	for _, domain := range cfg.Killswitch.Domains {
 		resolved, err := lockResolver.Resolve(domain)
 		item := ResolveItem{Domain: domain, IPv4: resolved.IPv4, IPv6: resolved.IPv6}

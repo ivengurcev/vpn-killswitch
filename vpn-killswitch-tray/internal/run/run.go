@@ -16,11 +16,24 @@ type Runner interface {
 	Run(name string, args ...string) (stdout string, stderr string, err error)
 }
 
+type InputRunner interface {
+	Runner
+	RunWithInput(input string, name string, args ...string) (stdout string, stderr string, err error)
+}
+
 type ExecRunner struct {
 	Timeout time.Duration
 }
 
 func (r ExecRunner) Run(name string, args ...string) (string, string, error) {
+	return r.run("", name, args...)
+}
+
+func (r ExecRunner) RunWithInput(input string, name string, args ...string) (string, string, error) {
+	return r.run(input, name, args...)
+}
+
+func (r ExecRunner) run(input string, name string, args ...string) (string, string, error) {
 	timeout := r.Timeout
 	if timeout == 0 {
 		timeout = DefaultTimeout
@@ -30,6 +43,9 @@ func (r ExecRunner) Run(name string, args ...string) (string, string, error) {
 
 	cmd := exec.CommandContext(ctx, name, args...)
 	var stdout, stderr bytes.Buffer
+	if input != "" {
+		cmd.Stdin = strings.NewReader(input)
+	}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()

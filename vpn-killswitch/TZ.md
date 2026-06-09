@@ -72,6 +72,7 @@ connection_types = ["vpn", "wireguard"]
 
 [bypass]
 domains = ["ozon.ru", "wildberries.ru"]
+ips = ["93.184.216.34", "93.184.216.0/24", "93.184.216.10-93.184.216.20"]
 state_path = "/run/vpn-killswitch/bypass-routes.v4"
 
 [killswitch]
@@ -87,6 +88,8 @@ run_dir = "/run/vpn-killswitch"
 
 - повторная установка не должна терять существующие значения;
 - домены должны нормализоваться к lowercase без завершающей точки;
+- bypass IP-записи должны поддерживать одиночный IPv4, CIDR и диапазон `IPv4-IPv4`;
+- bypass IP-записи должны нормализоваться и храниться в `bypass.ips`;
 - дубликаты доменов должны удаляться;
 - один и тот же домен не может одновременно находиться в bypass-списке и killswitch-списке;
 - команды добавления домена должны отказывать, если домен уже есть в любом из двух списков;
@@ -120,6 +123,7 @@ vpn-killswitch config add-bypass DOMAIN
 vpn-killswitch config remove-bypass DOMAIN
 vpn-killswitch config add-lock DOMAIN
 vpn-killswitch config remove-lock DOMAIN
+vpn-killswitch config apply-tray --enforce
 vpn-killswitch install-check
 ```
 
@@ -132,6 +136,35 @@ vpn-killswitch install-check
 --verbose
 --quiet
 ```
+
+### 5.1. Пакетное сохранение из tray
+
+Команда:
+
+```bash
+vpn-killswitch config apply-tray --enforce
+```
+
+Назначение: дать `vpn-killswitch-tray` один привилегированный вход для сохранения списков и применения правил.
+
+Payload передаётся через stdin в JSON:
+
+```json
+{
+  "bypass_domains": ["ozon.ru", "wildberries.ru"],
+  "bypass_ips": ["93.184.216.34", "93.184.216.0/24"],
+  "lock_domains": ["example.com"]
+}
+```
+
+Требования:
+
+- команда заменяет состав `bypass.domains` и `killswitch.domains` на переданный;
+- все домены нормализуются и валидируются до записи конфига;
+- пересечение между bypass и killswitch запрещено;
+- при `--enforce` команда сразу выполняет `enforce` в том же процессе;
+- один запуск команды должен требовать не больше одной аутентификации через `pkexec`;
+- `bypass_ips` в payload заменяет состав `bypass.ips`.
 
 ## 6. Команда enforce
 
@@ -170,8 +203,11 @@ Fail-closed правило:
 Требования:
 
 - резолвить `bypass.domains` в IPv4 через NSS/getent;
+- применять явные маршруты из `bypass.ips` без DNS-резолва;
 - удалять старые маршруты из state-файла перед применением новых;
 - добавлять маршруты вида `ip route replace IP/32 via GATEWAY dev DEV`;
+- для CIDR из `bypass.ips` добавлять CIDR-маршрут без раскрытия в `/32`;
+- диапазоны `IPv4-IPv4` преобразовывать в минимальный набор CIDR-маршрутов;
 - исключать VPN/виртуальные интерфейсы при выборе gateway: `lo`, `tun*`, `tap*`, `wg*`, `docker*`, `br-*`, `virbr*`, `veth*`;
 - хранить state-файл, чтобы можно было удалить ранее добавленные маршруты;
 - поддерживать `--dry-run`.

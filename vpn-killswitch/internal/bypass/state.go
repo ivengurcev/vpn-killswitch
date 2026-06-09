@@ -10,10 +10,13 @@ import (
 )
 
 type Route struct {
-	IP      string `json:"ip"`
-	Gateway string `json:"gateway"`
-	Dev     string `json:"dev"`
-	Domain  string `json:"domain"`
+	Target     string `json:"target"`
+	IP         string `json:"ip,omitempty"`
+	Gateway    string `json:"gateway"`
+	Dev        string `json:"dev"`
+	Domain     string `json:"domain,omitempty"`
+	SourceType string `json:"source_type"`
+	Source     string `json:"source"`
 }
 
 func ReadState(path string) ([]Route, error) {
@@ -33,7 +36,27 @@ func ReadState(path string) ([]Route, error) {
 		if len(fields) < 4 {
 			continue
 		}
-		routes = append(routes, Route{IP: fields[0], Gateway: fields[1], Dev: fields[2], Domain: fields[3]})
+		if len(fields) >= 5 {
+			routes = append(routes, Route{
+				Target:     fields[0],
+				IP:         targetIP(fields[0]),
+				Gateway:    fields[1],
+				Dev:        fields[2],
+				SourceType: fields[3],
+				Source:     fields[4],
+				Domain:     domainForSource(fields[3], fields[4]),
+			})
+			continue
+		}
+		routes = append(routes, Route{
+			Target:     legacyTarget(fields[0]),
+			IP:         fields[0],
+			Gateway:    fields[1],
+			Dev:        fields[2],
+			Domain:     fields[3],
+			SourceType: "domain",
+			Source:     fields[3],
+		})
 	}
 	return routes, scanner.Err()
 }
@@ -49,7 +72,7 @@ func WriteState(path string, routes []Route) error {
 	}
 	tmpPath := tmp.Name()
 	for _, route := range routes {
-		if _, err := fmt.Fprintf(tmp, "%s %s %s %s\n", route.IP, route.Gateway, route.Dev, route.Domain); err != nil {
+		if _, err := fmt.Fprintf(tmp, "%s %s %s %s %s\n", routeTarget(route), route.Gateway, route.Dev, routeSourceType(route), routeSource(route)); err != nil {
 			tmp.Close()
 			os.Remove(tmpPath)
 			return err
@@ -68,9 +91,51 @@ func WriteState(path string, routes []Route) error {
 
 func sortRoutes(routes []Route) {
 	sort.Slice(routes, func(i, j int) bool {
-		if routes[i].Domain == routes[j].Domain {
-			return routes[i].IP < routes[j].IP
+		if routeSource(routes[i]) == routeSource(routes[j]) {
+			return routeTarget(routes[i]) < routeTarget(routes[j])
 		}
-		return routes[i].Domain < routes[j].Domain
+		return routeSource(routes[i]) < routeSource(routes[j])
 	})
+}
+
+func routeTarget(route Route) string {
+	if route.Target != "" {
+		return route.Target
+	}
+	return legacyTarget(route.IP)
+}
+
+func routeSourceType(route Route) string {
+	if route.SourceType != "" {
+		return route.SourceType
+	}
+	return "domain"
+}
+
+func routeSource(route Route) string {
+	if route.Source != "" {
+		return route.Source
+	}
+	return route.Domain
+}
+
+func legacyTarget(ip string) string {
+	if strings.Contains(ip, "/") {
+		return ip
+	}
+	return ip + "/32"
+}
+
+func targetIP(target string) string {
+	if i := strings.Index(target, "/"); i >= 0 {
+		return target[:i]
+	}
+	return target
+}
+
+func domainForSource(sourceType, source string) string {
+	if sourceType == "domain" {
+		return source
+	}
+	return ""
 }

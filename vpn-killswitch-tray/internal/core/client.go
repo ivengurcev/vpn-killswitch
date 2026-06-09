@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -24,6 +25,12 @@ type ActionResult struct {
 	Stdout    string
 	Stderr    string
 	Cancelled bool
+}
+
+type ApplyTrayPayload struct {
+	BypassDomains []string `json:"bypass_domains"`
+	BypassIPs     []string `json:"bypass_ips"`
+	LockDomains   []string `json:"lock_domains"`
 }
 
 func (c Client) Status() (Snapshot, error) {
@@ -81,7 +88,23 @@ func (c Client) RemoveLockDomain(domain string) (ActionResult, error) {
 	return c.runPkexec("config", "remove-lock", domain)
 }
 
+func (c Client) ApplyTray(payload ApplyTrayPayload, enforce bool) (ActionResult, error) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	args := []string{"config", "apply-tray"}
+	if enforce {
+		args = append(args, "--enforce")
+	}
+	return c.runPkexecInput(string(data), args...)
+}
+
 func (c Client) runPkexec(args ...string) (ActionResult, error) {
+	return c.runPkexecInput("", args...)
+}
+
+func (c Client) runPkexecInput(input string, args ...string) (ActionResult, error) {
 	if c.CommandPath == "" {
 		return ActionResult{}, fmt.Errorf("vpn-killswitch command path is empty")
 	}
@@ -94,7 +117,13 @@ func (c Client) runPkexec(args ...string) (ActionResult, error) {
 	if c.ConfigPath != "" {
 		fullArgs = append(fullArgs, "--config", c.ConfigPath)
 	}
-	out, stderr, err := runner.Run("pkexec", fullArgs...)
+	var out, stderr string
+	var err error
+	if inputRunner, ok := runner.(run.InputRunner); ok {
+		out, stderr, err = inputRunner.RunWithInput(input, "pkexec", fullArgs...)
+	} else {
+		out, stderr, err = runner.Run("pkexec", fullArgs...)
+	}
 	result := ActionResult{Stdout: out, Stderr: stderr, Cancelled: isPkexecCancelled(stderr, err)}
 	if err != nil {
 		return result, err

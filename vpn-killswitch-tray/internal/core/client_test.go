@@ -10,11 +10,17 @@ type fakeRunner struct {
 	errOut string
 	err    error
 	args   []string
+	input  string
 }
 
 func (f *fakeRunner) Run(name string, args ...string) (string, string, error) {
 	f.args = append([]string{name}, args...)
 	return f.out, f.errOut, f.err
+}
+
+func (f *fakeRunner) RunWithInput(input string, name string, args ...string) (string, string, error) {
+	f.input = input
+	return f.Run(name, args...)
 }
 
 func TestClientStatus(t *testing.T) {
@@ -60,6 +66,29 @@ func TestClientLockEnableUsesActor(t *testing.T) {
 	}
 	if got := strings.Join(runner.args, " "); got != "pkexec /usr/local/sbin/vpn-killswitch lock enable tray" {
 		t.Fatalf("args = %s", got)
+	}
+}
+
+func TestClientApplyTrayUsesSinglePkexecWithJSONInput(t *testing.T) {
+	runner := &fakeRunner{out: `{"changed":true}`}
+	result, err := (Client{CommandPath: "/usr/local/sbin/vpn-killswitch", ConfigPath: "/etc/config.toml", Runner: runner}).ApplyTray(ApplyTrayPayload{
+		BypassDomains: []string{"ozon.ru"},
+		BypassIPs:     []string{"93.184.216.0/24"},
+		LockDomains:   []string{"lock.test"},
+	}, true)
+	if err != nil {
+		t.Fatalf("ApplyTray() error = %v", err)
+	}
+	if result.Stdout == "" {
+		t.Fatal("ApplyTray() stdout is empty")
+	}
+	if got := strings.Join(runner.args, " "); got != "pkexec /usr/local/sbin/vpn-killswitch config apply-tray --enforce --config /etc/config.toml" {
+		t.Fatalf("args = %s", got)
+	}
+	for _, want := range []string{`"bypass_domains":["ozon.ru"]`, `"bypass_ips":["93.184.216.0/24"]`, `"lock_domains":["lock.test"]`} {
+		if !strings.Contains(runner.input, want) {
+			t.Fatalf("input = %s, want %s", runner.input, want)
+		}
 	}
 }
 

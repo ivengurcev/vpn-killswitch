@@ -238,14 +238,18 @@ func diagnosticSummary(name, out string) string {
 
 type domainChanges struct {
 	AddBypass    []string
+	AddBypassIP  []string
 	RemoveBypass []string
+	RemoveIP     []string
 	AddLock      []string
 	RemoveLock   []string
 }
 
 func (c domainChanges) Empty() bool {
 	return len(c.AddBypass) == 0 &&
+		len(c.AddBypassIP) == 0 &&
 		len(c.RemoveBypass) == 0 &&
+		len(c.RemoveIP) == 0 &&
 		len(c.AddLock) == 0 &&
 		len(c.RemoveLock) == 0
 }
@@ -270,48 +274,24 @@ func (a *App) runEditDomainsAction() {
 		return
 	}
 	a.runAction("Домены", "Домены сохранены", func(c core.Client) (core.ActionResult, error) {
-		var last core.ActionResult
-		for _, domain := range changes.RemoveBypass {
-			result, err := c.RemoveBypassDomain(domain)
-			last = result
-			if err != nil {
-				return result, err
-			}
+		result, err := c.ApplyTray(core.ApplyTrayPayload{
+			BypassDomains: nextLists.Bypass,
+			BypassIPs:     nextLists.BypassIPs,
+			LockDomains:   nextLists.Lock,
+		}, a.Settings.AutoEnforceAfterConfigChange)
+		if err != nil {
+			return result, err
 		}
-		for _, domain := range changes.RemoveLock {
-			result, err := c.RemoveLockDomain(domain)
-			last = result
-			if err != nil {
-				return result, err
-			}
-		}
-		for _, domain := range changes.AddBypass {
-			result, err := c.AddBypassDomain(domain)
-			last = result
-			if err != nil {
-				return result, err
-			}
-		}
-		for _, domain := range changes.AddLock {
-			result, err := c.AddLockDomain(domain)
-			last = result
-			if err != nil {
-				return result, err
-			}
-		}
-		if a.Settings.AutoEnforceAfterConfigChange {
-			if enforceResult, err := c.Enforce("tray"); err != nil {
-				return enforceResult, err
-			}
-		}
-		last.Stdout = fmt.Sprintf(
-			"Домены сохранены: +bypass=%d -bypass=%d +lock=%d -lock=%d",
+		result.Stdout = fmt.Sprintf(
+			"Списки сохранены: +bypass=%d +ip=%d -bypass=%d -ip=%d +lock=%d -lock=%d",
 			len(changes.AddBypass),
+			len(changes.AddBypassIP),
 			len(changes.RemoveBypass),
+			len(changes.RemoveIP),
 			len(changes.AddLock),
 			len(changes.RemoveLock),
 		)
-		return last, nil
+		return result, nil
 	})
 }
 
@@ -321,7 +301,9 @@ func diffDomainLists(oldLists, nextLists domains.Lists) (domainChanges, error) {
 	}
 	return domainChanges{
 		AddBypass:    missingFrom(nextLists.Bypass, oldLists.Bypass),
+		AddBypassIP:  missingFrom(nextLists.BypassIPs, oldLists.BypassIPs),
 		RemoveBypass: missingFrom(oldLists.Bypass, nextLists.Bypass),
+		RemoveIP:     missingFrom(oldLists.BypassIPs, nextLists.BypassIPs),
 		AddLock:      missingFrom(nextLists.Lock, oldLists.Lock),
 		RemoveLock:   missingFrom(oldLists.Lock, nextLists.Lock),
 	}, nil
@@ -374,23 +356,33 @@ func (a *App) promptEditDomains(lists domains.Lists) (domains.Lists, bool) {
 		"--title", "Домены",
 		"--width", "820",
 		"--height", "620",
-		"--text", "Редактируй списки доменов. Один домен на строку. При сохранении приложение само добавит и удалит изменения.",
+		"--text", "Редактируй списки. Bypass принимает домены, IPv4, CIDR и диапазоны IPv4. Lock принимает только домены.",
 		"--field", "Bypass:TXT",
 		"--field", "Lock:TXT",
 		"--separator", sep,
 		"--button", "Сохранить:0",
 		"--button", "Отмена:1",
-		strings.Join(lists.Bypass, "\n"),
+		strings.Join(domains.BypassEntries(lists), "\n"),
 		strings.Join(lists.Lock, "\n"),
 	)
 	if err != nil {
 		a.Logger.Printf("domains dialog cancelled or failed: %v", err)
 		return domains.Lists{}, false
 	}
-	return parseDomainEditorOutput(out, sep), true
+	lists, err = parseDomainEditorOutputStrict(out, sep)
+	if err != nil {
+		a.logMessage("Домены", err.Error())
+		return domains.Lists{}, false
+	}
+	return lists, true
 }
 
 func parseDomainEditorOutput(out, sep string) domains.Lists {
+	lists, _ := parseDomainEditorOutputStrict(out, sep)
+	return lists
+}
+
+func parseDomainEditorOutputStrict(out, sep string) (domains.Lists, error) {
 	out = strings.TrimRight(out, "\r\n")
 	fields := strings.SplitN(out, sep, 3)
 	if len(fields) < 2 && sep != "|" {
@@ -398,12 +390,21 @@ func parseDomainEditorOutput(out, sep string) domains.Lists {
 	}
 	var lists domains.Lists
 	if len(fields) > 0 {
-		lists.Bypass = domains.ParseInput(fields[0])
+		bypassDomains, bypassIPs, err := domains.ParseBypassInput(fields[0])
+		if err != nil {
+			return domains.Lists{}, err
+		}
+		lists.Bypass = bypassDomains
+		lists.BypassIPs = bypassIPs
 	}
 	if len(fields) > 1 {
-		lists.Lock = domains.ParseInput(fields[1])
+		lockDomains, err := domains.ParseDomainInput(fields[1])
+		if err != nil {
+			return domains.Lists{}, err
+		}
+		lists.Lock = lockDomains
 	}
-	return lists
+	return lists, nil
 }
 
 func firstOverlap(left, right []string) string {

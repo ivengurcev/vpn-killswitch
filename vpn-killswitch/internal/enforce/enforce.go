@@ -39,6 +39,7 @@ func Run(opts Options, runner run.Runner, bypassResolver BypassResolver, lockRes
 
 	bypassResult, err := bypass.Apply(bypass.Options{
 		Domains:   opts.Config.Bypass.Domains,
+		IPs:       opts.Config.Bypass.IPs,
 		StatePath: opts.Config.Bypass.StatePath,
 		DryRun:    opts.DryRun,
 	}, runner, bypassResolver, logger)

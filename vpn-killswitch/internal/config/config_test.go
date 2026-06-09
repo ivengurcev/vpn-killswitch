@@ -33,6 +33,22 @@ domains = ["OZON.RU.", "wildberries.ru", "ozon.ru"]
 	}
 }
 
+func TestDecodeNormalizesBypassIPs(t *testing.T) {
+	cfg, err := Decode(`
+[vpn]
+connection_name = "Work VPN"
+
+[bypass]
+ips = ["93.184.216.34", "93.184.216.99/24", "93.184.216.10-93.184.216.20", "93.184.216.34"]
+`)
+	if err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if got, want := strings.Join(cfg.Bypass.IPs, ","), "93.184.216.0/24,93.184.216.10-93.184.216.20,93.184.216.34"; got != want {
+		t.Fatalf("bypass ips = %q, want %q", got, want)
+	}
+}
+
 func TestDecodeRejectsDomainOverlap(t *testing.T) {
 	_, err := Decode(`
 [vpn]
@@ -61,6 +77,35 @@ connection_name = "Work VPN"
 		t.Fatal("Decode() expected empty domains error")
 	}
 	if !strings.Contains(err.Error(), "at least one") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestDecodeAllowsOnlyBypassIPs(t *testing.T) {
+	_, err := Decode(`
+[vpn]
+connection_name = "Work VPN"
+
+[bypass]
+ips = ["93.184.216.0/24"]
+`)
+	if err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+}
+
+func TestDecodeRejectsBadBypassIP(t *testing.T) {
+	_, err := Decode(`
+[vpn]
+connection_name = "Work VPN"
+
+[bypass]
+ips = ["2001:db8::1"]
+`)
+	if err == nil {
+		t.Fatal("Decode() expected bypass IP error")
+	}
+	if !strings.Contains(err.Error(), "invalid IPv4") {
 		t.Fatalf("error = %v", err)
 	}
 }

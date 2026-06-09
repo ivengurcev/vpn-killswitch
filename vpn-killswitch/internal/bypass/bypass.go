@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"vpn-killswitch/internal/gateway"
+	"vpn-killswitch/internal/ipaddr"
 	"vpn-killswitch/internal/log"
 	"vpn-killswitch/internal/run"
 )
@@ -21,6 +22,7 @@ type Result struct {
 
 type Options struct {
 	Domains   []string
+	IPs       []string
 	StatePath string
 	DryRun    bool
 }
@@ -40,27 +42,31 @@ func Apply(opts Options, runner run.Runner, resolver IPv4Resolver, logger log.Lo
 
 	for _, old := range oldRoutes {
 		if opts.DryRun {
-			logger.Info("dry-run bypass route delete: %s/32 via %s dev %s", old.IP, old.Gateway, old.Dev)
+			logger.Info("dry-run bypass route delete: %s via %s dev %s", routeTarget(old), old.Gateway, old.Dev)
 			continue
 		}
 		if err := DeleteRoute(runner, old); err != nil {
-			logger.Warn("bypass route delete failed: %s/32 via %s dev %s: %v", old.IP, old.Gateway, old.Dev, err)
+			logger.Warn("bypass route delete failed: %s via %s dev %s: %v", routeTarget(old), old.Gateway, old.Dev, err)
 		}
 	}
 
-	result.NewRoutes = BuildRoutes(opts.Domains, gw, resolver, logger)
-	if len(opts.Domains) > 0 && len(result.NewRoutes) == 0 {
+	routes, domainRouteCount, err := BuildRoutes(opts.Domains, opts.IPs, gw, resolver, logger)
+	if err != nil {
+		return result, err
+	}
+	result.NewRoutes = routes
+	if len(opts.Domains) > 0 && domainRouteCount == 0 {
 		return result, fmt.Errorf("no bypass domains resolved to IPv4")
 	}
 
 	for _, route := range result.NewRoutes {
 		if opts.DryRun {
-			logger.Info("dry-run bypass route add: %s %s/32 via %s dev %s", route.Domain, route.IP, route.Gateway, route.Dev)
+			logger.Info("dry-run bypass route add: %s %s via %s dev %s", routeSource(route), routeTarget(route), route.Gateway, route.Dev)
 			continue
 		}
 		if err := AddRoute(runner, route); err != nil {
 			result.Failures++
-			logger.Error("bypass route add failed: %s %s/32 via %s dev %s: %v", route.Domain, route.IP, route.Gateway, route.Dev, err)
+			logger.Error("bypass route add failed: %s %s via %s dev %s: %v", routeSource(route), routeTarget(route), route.Gateway, route.Dev, err)
 		}
 	}
 
@@ -77,9 +83,10 @@ func Apply(opts Options, runner run.Runner, resolver IPv4Resolver, logger log.Lo
 	return result, nil
 }
 
-func BuildRoutes(domains []string, gw gateway.Gateway, resolver IPv4Resolver, logger log.Logger) []Route {
+func BuildRoutes(domains []string, ips []string, gw gateway.Gateway, resolver IPv4Resolver, logger log.Logger) ([]Route, int, error) {
 	seen := map[string]bool{}
 	var routes []Route
+	domainRouteCount := 0
 	for _, domain := range domains {
 		ips, err := resolver.ResolveIPv4(domain)
 		if err != nil {
@@ -92,19 +99,38 @@ func BuildRoutes(domains []string, gw gateway.Gateway, resolver IPv4Resolver, lo
 				continue
 			}
 			seen[key] = true
-			routes = append(routes, Route{IP: ip, Gateway: gw.Via, Dev: gw.Dev, Domain: domain})
+			routes = append(routes, Route{Target: ip + "/32", IP: ip, Gateway: gw.Via, Dev: gw.Dev, Domain: domain, SourceType: "domain", Source: domain})
+			domainRouteCount++
+		}
+	}
+	entries, err := ipaddr.NormalizeBypassEntries(ips)
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, raw := range entries {
+		entry, err := ipaddr.ParseBypassEntry(raw)
+		if err != nil {
+			return nil, 0, err
+		}
+		for _, prefix := range entry.Prefixes {
+			key := "ip|" + prefix
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			routes = append(routes, Route{Target: prefix, IP: targetIP(prefix), Gateway: gw.Via, Dev: gw.Dev, SourceType: "ip", Source: entry.Value})
 		}
 	}
 	sortRoutes(routes)
-	return routes
+	return routes, domainRouteCount, nil
 }
 
 func AddRoute(r run.Runner, route Route) error {
-	_, _, err := r.Run("ip", "route", "replace", route.IP+"/32", "via", route.Gateway, "dev", route.Dev)
+	_, _, err := r.Run("ip", "route", "replace", routeTarget(route), "via", route.Gateway, "dev", route.Dev)
 	return err
 }
 
 func DeleteRoute(r run.Runner, route Route) error {
-	_, _, err := r.Run("ip", "route", "del", route.IP+"/32", "via", route.Gateway, "dev", route.Dev)
+	_, _, err := r.Run("ip", "route", "del", routeTarget(route), "via", route.Gateway, "dev", route.Dev)
 	return err
 }

@@ -26,6 +26,7 @@ connection_types = ["vpn", "wireguard"]
 
 [bypass]
 domains = ["ozon.ru", "wildberries.ru"]
+ips = ["93.184.216.34", "93.184.216.0/24", "93.184.216.10-93.184.216.20"]
 state_path = "/run/vpn-killswitch/bypass-routes.v4"
 
 [killswitch]
@@ -55,7 +56,20 @@ vpn-killswitch config add-bypass DOMAIN
 vpn-killswitch config remove-bypass DOMAIN
 vpn-killswitch config add-lock DOMAIN
 vpn-killswitch config remove-lock DOMAIN
+vpn-killswitch config apply-tray --enforce
 ```
+
+`config apply-tray` reads a JSON payload from stdin and is intended for `vpn-killswitch-tray` bulk saves:
+
+```json
+{
+  "bypass_domains": ["ozon.ru", "wildberries.ru"],
+  "bypass_ips": ["93.184.216.34", "93.184.216.0/24"],
+  "lock_domains": ["example.com"]
+}
+```
+
+With `--enforce`, config changes and rule application happen in one privileged process.
 
 ## Legacy Cleanup
 

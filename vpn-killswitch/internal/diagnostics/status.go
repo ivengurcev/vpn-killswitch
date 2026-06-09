@@ -36,6 +36,7 @@ type GatewayStatus struct {
 
 type BypassStatus struct {
 	DomainCount int    `json:"domain_count"`
+	IPCount     int    `json:"ip_count"`
 	RouteCount  int    `json:"route_count"`
 	StatePath   string `json:"state_path"`
 }
@@ -75,6 +76,7 @@ func CollectStatus(cfg config.Config, configPath string, runner run.Runner) Stat
 	}
 	status.Bypass = BypassStatus{
 		DomainCount: len(cfg.Bypass.Domains),
+		IPCount:     len(cfg.Bypass.IPs),
 		RouteCount:  len(routes),
 		StatePath:   cfg.Bypass.StatePath,
 	}

@@ -56,6 +56,112 @@ domains = ["lock.test"]
 	}
 }
 
+func TestApplyTrayReplacesLists(t *testing.T) {
+	path := writeTestConfig(t, `
+[vpn]
+connection_name = "Work VPN"
+
+[bypass]
+domains = ["old.example"]
+
+[killswitch]
+domains = ["old-lock.example"]
+`)
+	result, err := ApplyTray(path, ApplyTrayPayload{
+		BypassDomains:    []string{"OZON.RU.", "wildberries.ru", "ozon.ru"},
+		BypassIPs:        []string{"93.184.216.99/24", "93.184.216.34"},
+		LockDomains:      []string{"LOCK.TEST."},
+		hasBypassDomains: true,
+		hasBypassIPs:     true,
+		hasLockDomains:   true,
+	}, false)
+	if err != nil {
+		t.Fatalf("ApplyTray() error = %v", err)
+	}
+	if !result.Changed {
+		t.Fatal("ApplyTray() did not report change")
+	}
+	cfg, err := config.Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := join(cfg.Bypass.Domains), "ozon.ru,wildberries.ru"; got != want {
+		t.Fatalf("bypass domains = %q, want %q", got, want)
+	}
+	if got, want := join(cfg.Bypass.IPs), "93.184.216.0/24,93.184.216.34"; got != want {
+		t.Fatalf("bypass ips = %q, want %q", got, want)
+	}
+	if got, want := join(cfg.Killswitch.Domains), "lock.test"; got != want {
+		t.Fatalf("lock domains = %q, want %q", got, want)
+	}
+}
+
+func TestApplyTrayDryRunDoesNotWrite(t *testing.T) {
+	path := writeTestConfig(t, `
+[vpn]
+connection_name = "Work VPN"
+
+[bypass]
+domains = ["old.example"]
+`)
+	result, err := ApplyTray(path, ApplyTrayPayload{
+		BypassDomains:    []string{"new.example"},
+		hasBypassDomains: true,
+		hasBypassIPs:     true,
+		hasLockDomains:   true,
+	}, true)
+	if err != nil {
+		t.Fatalf("ApplyTray() error = %v", err)
+	}
+	if !result.Changed {
+		t.Fatal("ApplyTray() did not report planned change")
+	}
+	cfg, err := config.Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := join(cfg.Bypass.Domains), "old.example"; got != want {
+		t.Fatalf("bypass domains after dry-run = %q, want %q", got, want)
+	}
+}
+
+func TestApplyTrayRejectsBadBypassIPs(t *testing.T) {
+	path := writeTestConfig(t, `
+[vpn]
+connection_name = "Work VPN"
+
+[bypass]
+domains = ["old.example"]
+`)
+	_, err := ApplyTray(path, ApplyTrayPayload{
+		BypassDomains:    []string{"old.example"},
+		BypassIPs:        []string{"2001:db8::1"},
+		hasBypassDomains: true,
+		hasBypassIPs:     true,
+		hasLockDomains:   true,
+	}, false)
+	if err == nil {
+		t.Fatal("ApplyTray() expected bypass IP error")
+	}
+}
+
+func TestApplyTrayRejectsIncompletePayload(t *testing.T) {
+	path := writeTestConfig(t, `
+[vpn]
+connection_name = "Work VPN"
+
+[bypass]
+domains = ["old.example"]
+`)
+	_, err := ApplyTray(path, ApplyTrayPayload{
+		BypassDomains:    []string{"new.example"},
+		hasBypassDomains: true,
+	}, false)
+	if err == nil {
+		t.Fatal("ApplyTray() expected incomplete payload error")
+	}
+}
+
 func writeTestConfig(t *testing.T, data string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.toml")
@@ -63,4 +169,15 @@ func writeTestConfig(t *testing.T, data string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func join(values []string) string {
+	out := ""
+	for i, value := range values {
+		if i > 0 {
+			out += ","
+		}
+		out += value
+	}
+	return out
 }

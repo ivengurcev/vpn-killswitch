@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+
+	"vpn-killswitch/internal/ipaddr"
 )
 
 const (
@@ -37,6 +39,7 @@ type VPNConfig struct {
 
 type BypassConfig struct {
 	Domains   []string `toml:"domains" json:"domains"`
+	IPs       []string `toml:"ips" json:"ips"`
 	StatePath string   `toml:"state_path" json:"state_path"`
 }
 
@@ -95,6 +98,9 @@ func (c *Config) Normalize() {
 	c.VPN.ConnectionName = strings.TrimSpace(c.VPN.ConnectionName)
 	c.VPN.ConnectionTypes = normalizeWords(c.VPN.ConnectionTypes)
 	c.Bypass.Domains = NormalizeDomains(c.Bypass.Domains)
+	if ips, err := ipaddr.NormalizeBypassEntries(c.Bypass.IPs); err == nil {
+		c.Bypass.IPs = ips
+	}
 	c.Killswitch.Domains = NormalizeDomains(c.Killswitch.Domains)
 	c.Bypass.StatePath = defaultString(c.Bypass.StatePath, DefaultBypassStatePath)
 	c.Killswitch.HostsFile = defaultString(c.Killswitch.HostsFile, DefaultHostsFile)
@@ -111,8 +117,8 @@ func (c Config) Validate() error {
 	if len(c.VPN.ConnectionTypes) == 0 {
 		errs = append(errs, "vpn.connection_types must not be empty")
 	}
-	if len(c.Bypass.Domains) == 0 && len(c.Killswitch.Domains) == 0 {
-		errs = append(errs, "at least one of bypass.domains or killswitch.domains must be non-empty")
+	if len(c.Bypass.Domains) == 0 && len(c.Bypass.IPs) == 0 && len(c.Killswitch.Domains) == 0 {
+		errs = append(errs, "at least one of bypass.domains, bypass.ips or killswitch.domains must be non-empty")
 	}
 	if c.Bypass.StatePath == "" {
 		errs = append(errs, "bypass.state_path is required")
@@ -134,6 +140,9 @@ func (c Config) Validate() error {
 	}
 	if bad := firstInvalidDomain(append([]string{}, append(c.Bypass.Domains, c.Killswitch.Domains...)...)); bad != "" {
 		errs = append(errs, fmt.Sprintf("invalid domain: %s", bad))
+	}
+	if _, err := ipaddr.NormalizeBypassEntries(c.Bypass.IPs); err != nil {
+		errs = append(errs, err.Error())
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf(strings.Join(errs, "; "))
@@ -194,6 +203,7 @@ connection_types = ["vpn", "wireguard"]
 
 [bypass]
 domains = ["ozon.ru", "wildberries.ru"]
+ips = ["93.184.216.34", "93.184.216.0/24", "93.184.216.10-93.184.216.20"]
 state_path = "/run/vpn-killswitch/bypass-routes.v4"
 
 [killswitch]

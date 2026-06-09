@@ -50,6 +50,7 @@ type options struct {
 	noEnable   bool
 	noStart    bool
 	purge      bool
+	enforce    bool
 	destDir    string
 }
 
@@ -126,7 +127,7 @@ func Run(args []string) int {
 			logger.Error("unknown bypass command: %s", subcmd)
 			return ExitBadArgs
 		}
-		result, err := bypass.Apply(bypass.Options{Domains: cfg.Bypass.Domains, StatePath: cfg.Bypass.StatePath, DryRun: opts.dryRun}, runner, bypassResolver, logger)
+		result, err := bypass.Apply(bypass.Options{Domains: cfg.Bypass.Domains, IPs: cfg.Bypass.IPs, StatePath: cfg.Bypass.StatePath, DryRun: opts.dryRun}, runner, bypassResolver, logger)
 		if opts.json {
 			printJSON(result)
 		}
@@ -178,6 +179,9 @@ func Run(args []string) int {
 }
 
 func runConfigEdit(subcmd, domain string, opts options, logger log.Logger) int {
+	if subcmd == "apply-tray" {
+		return runConfigApplyTray(opts, logger)
+	}
 	if domain == "" {
 		logger.Error("config %s requires DOMAIN", subcmd)
 		return ExitBadArgs
@@ -222,6 +226,62 @@ func runConfigEdit(subcmd, domain string, opts options, logger log.Logger) int {
 		logger.Info("config updated: %s", result.Domain)
 	} else {
 		logger.Info("config unchanged: %s", result.Domain)
+	}
+	return ExitOK
+}
+
+type configApplyTrayOutput struct {
+	configedit.ApplyTrayResult
+	Enforced bool           `json:"enforced"`
+	Enforce  enforce.Result `json:"enforce,omitempty"`
+}
+
+func runConfigApplyTray(opts options, logger log.Logger) int {
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		logger.Error("read apply-tray payload: %v", err)
+		return ExitBadArgs
+	}
+	var payload configedit.ApplyTrayPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		logger.Error("parse apply-tray payload: %v", err)
+		return ExitBadArgs
+	}
+	result, err := configedit.ApplyTray(opts.configPath, payload, opts.dryRun)
+	if err != nil {
+		logger.Error("config apply-tray: %v", err)
+		return ExitConfig
+	}
+
+	output := configApplyTrayOutput{ApplyTrayResult: result}
+	if opts.enforce && !opts.dryRun {
+		release, code := acquireIfNeeded(result.Config, "enforce", "", false, logger)
+		if code != ExitOK {
+			return code
+		}
+		if release != nil {
+			defer release()
+		}
+		runner := run.ExecRunner{}
+		bypassResolver := resolver.Getent{Runner: runner}
+		lockResolver := lockdns.Resolver{Runner: runner}
+		enforceResult, err := enforce.Run(enforce.Options{Config: result.Config, Reason: "tray"}, runner, bypassResolver, lockResolver, logger)
+		output.Enforced = err == nil
+		output.Enforce = enforceResult
+		if opts.json {
+			printJSON(output)
+		}
+		return codeForApplyError(err)
+	}
+
+	if opts.json {
+		printJSON(output)
+	} else if opts.dryRun {
+		logger.Info("dry-run config apply-tray: bypass=%d bypass_ips=%d lock=%d enforce=%t", len(result.BypassDomains), len(result.BypassIPs), len(result.LockDomains), opts.enforce)
+	} else if result.Changed {
+		logger.Info("config updated: bypass=%d bypass_ips=%d lock=%d", len(result.BypassDomains), len(result.BypassIPs), len(result.LockDomains))
+	} else {
+		logger.Info("config unchanged: bypass=%d bypass_ips=%d lock=%d", len(result.BypassDomains), len(result.BypassIPs), len(result.LockDomains))
 	}
 	return ExitOK
 }
@@ -281,6 +341,7 @@ func parse(args []string) (cmd string, subcmd string, reason string, opts option
 	fs.BoolVar(&opts.noEnable, "no-enable", false, "do not enable systemd units during install")
 	fs.BoolVar(&opts.noStart, "no-start", false, "do not start initial service during install")
 	fs.BoolVar(&opts.purge, "purge", false, "remove config/state/log during uninstall")
+	fs.BoolVar(&opts.enforce, "enforce", false, "apply rules after config change")
 	fs.StringVar(&opts.destDir, "destdir", "", "stage install/uninstall under DIR")
 	if err := fs.Parse(flagArgs); err != nil {
 		return cmd, subcmd, "", opts, err
@@ -300,7 +361,11 @@ func parse(args []string) (cmd string, subcmd string, reason string, opts option
 			return cmd, subcmd, "", opts, fmt.Errorf("unexpected argument: %s", positional[0])
 		}
 	case "config":
-		if len(positional) != 1 {
+		if subcmd == "apply-tray" {
+			if len(positional) != 0 {
+				return cmd, subcmd, "", opts, fmt.Errorf("config apply-tray does not accept positional arguments")
+			}
+		} else if len(positional) != 1 {
 			return cmd, subcmd, "", opts, fmt.Errorf("config %s requires exactly one domain", subcmd)
 		}
 	default:
@@ -319,6 +384,7 @@ func splitArgs(args []string) ([]string, []string, error) {
 	boolFlags := map[string]bool{
 		"--dry-run": true, "-dry-run": true, "--json": true, "-json": true, "--verbose": true, "-verbose": true, "--quiet": true, "-quiet": true,
 		"--no-copy": true, "-no-copy": true, "--no-enable": true, "-no-enable": true, "--no-start": true, "-no-start": true, "--purge": true, "-purge": true,
+		"--enforce": true, "-enforce": true,
 	}
 	var flagArgs, positional []string
 	for i := 0; i < len(args); i++ {
@@ -417,7 +483,7 @@ func printStatus(status diagnostics.Status) {
 	} else {
 		fmt.Printf("Gateway: %s dev %s\n", status.Gateway.Via, status.Gateway.Dev)
 	}
-	fmt.Printf("Bypass: %d domains, %d routes\n", status.Bypass.DomainCount, status.Bypass.RouteCount)
+	fmt.Printf("Bypass: %d domains, %d IP entries, %d routes\n", status.Bypass.DomainCount, status.Bypass.IPCount, status.Bypass.RouteCount)
 	fmt.Printf("Lock: %d domains, nft=%t, hosts=%t\n", status.Lock.DomainCount, status.Lock.NFTActive, status.Lock.HostsBlock)
 	fmt.Printf("Config: %s\n", status.Config.Path)
 	if len(status.Errors) > 0 {
@@ -436,6 +502,9 @@ func printResolve(result diagnostics.ResolveResult) {
 			fmt.Printf(" error=%s", item.Error)
 		}
 		fmt.Println()
+	}
+	if len(result.IPs) > 0 {
+		fmt.Printf("  explicit IPv4=%s\n", strings.Join(result.IPs, ","))
 	}
 	fmt.Println("Lock:")
 	for _, item := range result.Lock {
@@ -481,6 +550,7 @@ Commands:
   config remove-bypass DOMAIN
   config add-lock DOMAIN
   config remove-lock DOMAIN
+  config apply-tray --enforce
   version
   help
 
@@ -488,6 +558,7 @@ Flags:
   --config PATH
   --dry-run
   --json
+  --enforce
   --verbose
   --quiet
 
