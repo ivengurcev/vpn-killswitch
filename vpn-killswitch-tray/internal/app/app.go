@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -138,11 +139,11 @@ func (a *App) handleMenu() {
 		case <-a.domainsItem.ClickedCh:
 			go a.runEditDomainsAction()
 		case <-a.test.ClickedCh:
-			a.runDiagnostic("test")
+			go a.runDiagnostic("test")
 		case <-a.check.ClickedCh:
-			a.runDiagnostic("install-check")
+			go a.runDiagnostic("install-check")
 		case <-a.resolve.ClickedCh:
-			a.runDiagnostic("resolve")
+			go a.runDiagnostic("resolve")
 		case <-a.about.ClickedCh:
 			a.Logger.Printf("about opened")
 		case <-a.quit.ClickedCh:
@@ -209,13 +210,19 @@ func (a *App) runDiagnostic(name string) {
 	if a.Settings.ConfigPath != "" {
 		args = append(args, "--config", a.Settings.ConfigPath)
 	}
-	out, _, err := a.Runner.Run(a.corePath, args...)
+	out, stderr, err := a.dialogRunner().Run(a.corePath, args...)
+	summary := diagnosticSummary(name, out)
 	if err != nil {
+		if strings.TrimSpace(out) == "" {
+			out = strings.TrimSpace(stderr)
+		}
 		a.Logger.Printf("%s error: %v", name, err)
+		a.showText("Диагностика: "+name, diagnosticText(name, summary, out, err), summary)
+		a.refreshNow()
 		return
 	}
-	summary := diagnosticSummary(name, out)
 	a.Logger.Printf("%s: %s", name, summary)
+	a.showText("Диагностика: "+name, diagnosticText(name, summary, out, nil), summary)
 	a.refreshNow()
 }
 
@@ -234,6 +241,19 @@ func diagnosticSummary(name, out string) string {
 		return "resolve completed"
 	}
 	return fmt.Sprintf("%s completed", name)
+}
+
+func diagnosticText(name, summary, out string, err error) string {
+	out = strings.TrimSpace(out)
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s: %s", name, summary)
+	if err != nil {
+		fmt.Fprintf(&b, "\nОшибка запуска: %v", err)
+	}
+	if out != "" {
+		fmt.Fprintf(&b, "\n\n%s", out)
+	}
+	return b.String()
 }
 
 type domainChanges struct {
@@ -436,6 +456,34 @@ func (a *App) showText(title, text, fallbackNotification string) {
 	}
 	if a.Tools.KDialog {
 		_, _, err := a.dialogRunner().Run("kdialog", "--title", title, "--msgbox", text)
+		if err != nil {
+			a.Logger.Printf("%s dialog error: %v", title, err)
+		}
+		return
+	}
+	if a.Tools.Yad {
+		tmp, err := os.CreateTemp("", "vpn-killswitch-tray-diagnostic-*.txt")
+		if err != nil {
+			a.Logger.Printf("%s dialog temp file error: %v", title, err)
+			a.logMessage(title, fallbackNotification)
+			return
+		}
+		path := tmp.Name()
+		if _, err := tmp.WriteString(text); err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(path)
+			a.Logger.Printf("%s dialog temp file error: %v", title, err)
+			a.logMessage(title, fallbackNotification)
+			return
+		}
+		if err := tmp.Close(); err != nil {
+			_ = os.Remove(path)
+			a.Logger.Printf("%s dialog temp file error: %v", title, err)
+			a.logMessage(title, fallbackNotification)
+			return
+		}
+		defer os.Remove(path)
+		_, _, err = a.dialogRunner().Run("yad", "--text-info", "--title", title, "--width", "760", "--height", "520", "--button", "OK:0", "--filename", path)
 		if err != nil {
 			a.Logger.Printf("%s dialog error: %v", title, err)
 		}

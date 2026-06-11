@@ -27,6 +27,19 @@ func TestParseDomainEditorOutputRejectsLockIP(t *testing.T) {
 	}
 }
 
+func TestDiagnosticTextIncludesStdoutOnFailure(t *testing.T) {
+	text := diagnosticText("test", "FAIL", `{"ok":false}`, errFake{})
+	if !strings.Contains(text, "test: FAIL") || !strings.Contains(text, `{"ok":false}`) || !strings.Contains(text, "Ошибка запуска") {
+		t.Fatalf("diagnostic text = %q", text)
+	}
+}
+
+type errFake struct{}
+
+func (errFake) Error() string {
+	return "exit status 10"
+}
+
 func TestDiffDomainLists(t *testing.T) {
 	oldLists := domains.Lists{
 		Bypass:    []string{"old-bypass.test", "stay-bypass.test"},

@@ -60,6 +60,29 @@ func TestParseBypassInputSplitsDomainsAndIPs(t *testing.T) {
 	}
 }
 
+func TestParseBypassInputHandlesEscapedNewlinesFromYad(t *testing.T) {
+	domains, ips, err := ParseBypassInput(`ozon.ru\nwildberries.ru\n93.184.216.99/24`)
+	if err != nil {
+		t.Fatalf("ParseBypassInput() error = %v", err)
+	}
+	if got := strings.Join(domains, ","); got != "ozon.ru,wildberries.ru" {
+		t.Fatalf("domains = %q", got)
+	}
+	if got := strings.Join(ips, ","); got != "93.184.216.0/24" {
+		t.Fatalf("ips = %q", got)
+	}
+}
+
+func TestParseDomainInputHandlesEscapedNewlinesFromYad(t *testing.T) {
+	domains, err := ParseDomainInput(`claude.com\napi.anthropic.com`)
+	if err != nil {
+		t.Fatalf("ParseDomainInput() error = %v", err)
+	}
+	if got := strings.Join(domains, ","); got != "claude.com,api.anthropic.com" {
+		t.Fatalf("domains = %q", got)
+	}
+}
+
 func TestParseBypassInputRejectsBadIP(t *testing.T) {
 	_, _, err := ParseBypassInput("2001:db8::1")
 	if err == nil {

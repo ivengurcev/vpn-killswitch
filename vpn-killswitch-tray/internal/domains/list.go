@@ -70,6 +70,7 @@ func ParseInput(input string) []string {
 }
 
 func ParseDomainInput(input string) ([]string, error) {
+	input = normalizeEditorEscapes(input)
 	seen := map[string]bool{}
 	var out []string
 	for _, part := range inputSplit.Split(input, -1) {
@@ -87,6 +88,7 @@ func ParseDomainInput(input string) ([]string, error) {
 }
 
 func ParseBypassInput(input string) ([]string, []string, error) {
+	input = normalizeEditorEscapes(input)
 	seenDomains := map[string]bool{}
 	seenIPs := map[string]bool{}
 	var domains []string
@@ -199,4 +201,10 @@ func parseIPv4(raw string) (netip.Addr, error) {
 		return netip.Addr{}, fmt.Errorf("invalid IPv4")
 	}
 	return addr, nil
+}
+
+func normalizeEditorEscapes(input string) string {
+	input = strings.ReplaceAll(input, `\r\n`, "\n")
+	input = strings.ReplaceAll(input, `\n`, "\n")
+	return input
 }
